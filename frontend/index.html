@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CodeGraph AI</title>
+    <link rel="stylesheet" href="/frontend/styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <aside class="sidebar">
+          <div class="brand">
+            <img src="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png" alt="GitHub mark">
+            <div>
+              <h1>CodeGraph AI</h1>
+              <p>Map a repository into architecture, flow, and answers.</p>
+            </div>
+          </div>
+
+          <label class="field">
+            <span>Backend URL</span>
+            <input id="apiBase" autocomplete="off">
+          </label>
+
+          <label class="field">
+            <span>GitHub repository</span>
+            <input id="repoUrl" placeholder="https://github.com/owner/repo" autocomplete="off">
+          </label>
+
+          <div class="actions">
+            <button id="healthBtn" type="button">Check Health</button>
+            <button id="ingestBtn" type="button" class="primary">Analyze Repo</button>
+          </div>
+
+          <div class="repo-meta">
+            <div>
+              <span>Owner</span>
+              <strong id="ownerLabel">-</strong>
+            </div>
+            <div>
+              <span>Repo</span>
+              <strong id="repoLabel">-</strong>
+            </div>
+          </div>
+
+          <nav class="view-tabs" aria-label="Views">
+            <button class="tab active" data-view="tree" type="button">Tree</button>
+            <button class="tab" data-view="pipeline" type="button">Flow</button>
+            <button class="tab" data-view="graph" type="button">Graph</button>
+            <button class="tab" data-view="query" type="button">Ask</button>
+          </nav>
+
+          <p id="statusText" class="status-text">Ready.</p>
+        </aside>
+
+        <section class="content">
+          <header class="topbar">
+            <div>
+              <p class="eyebrow">Repository Intelligence</p>
+              <h2 id="viewTitle">Hierarchical Tree</h2>
+            </div>
+            <div id="healthPills" class="health-pills"></div>
+          </header>
+
+          <section id="treeView" class="view active">
+            <div class="tree-layout">
+              <section class="panel">
+                <div class="panel-head">
+                  <h3>Visual Tree</h3>
+                  <div class="inline-actions">
+                    <label class="readme-toggle">
+                      <input id="treeReadmeToggle" type="checkbox" checked>
+                      <span>Read README</span>
+                    </label>
+                    <button id="loadTreeBtn" type="button">Load Tree</button>
+                  </div>
+                </div>
+                <div class="tree-canvas-wrap">
+                  <svg id="treeSvg" class="tree-svg" role="img" aria-label="Repository hierarchy tree"></svg>
+                </div>
+                <div id="treeList" class="tree-list empty">Analyze a repository, then load the tree.</div>
+              </section>
+
+              <section class="panel">
+                <div class="panel-head">
+                  <h3>Selected Node</h3>
+                </div>
+                <div id="nodeDetail" class="detail empty">Select a file to inspect its role, relations, and annotated code.</div>
+              </section>
+            </div>
+          </section>
+
+          <section id="pipelineView" class="view">
+            <div class="panel architecture-panel">
+              <div class="panel-head">
+                <h3>Architecture Flow</h3>
+                <div class="inline-actions">
+                  <label class="readme-toggle">
+                    <input id="flowReadmeToggle" type="checkbox" checked>
+                    <span>Read README</span>
+                  </label>
+                  <button id="loadPipelineBtn" type="button">Generate Flow</button>
+                </div>
+              </div>
+              <p id="pipelineDescription" class="summary-text"></p>
+              <div class="architecture-canvas-wrap">
+                <svg id="architectureSvg" class="architecture-svg" role="img" aria-label="Architecture flow diagram"></svg>
+              </div>
+              <div id="pipelineList" class="pipeline-list empty">Generate the architecture flow after analyzing a repository.</div>
+            </div>
+          </section>
+
+          <section id="graphView" class="view">
+            <div class="panel graph-panel presentation-graph-panel">
+              <div class="panel-head">
+                <h3>Presentation Graph</h3>
+                <div class="inline-actions">
+                  <label class="readme-toggle">
+                    <input id="graphReadmeToggle" type="checkbox" checked>
+                    <span>Read README</span>
+                  </label>
+                  <select id="graphFilter" aria-label="Graph filter">
+                    <option value="presentation">Presentation</option>
+                    <option value="with_functions">Raw With Functions</option>
+                    <option value="files_only">Raw Files Only</option>
+                    <option value="full">Raw Full</option>
+                  </select>
+                  <button id="loadGraphBtn" type="button">Generate Graph</button>
+                </div>
+              </div>
+              <svg id="graphSvg" class="graph-svg" role="img" aria-label="Repository graph"></svg>
+              <div id="graphStats" class="summary-text"></div>
+            </div>
+          </section>
+
+          <section id="queryView" class="view">
+            <div class="panel">
+              <div class="panel-head">
+                <h3>Ask The Codebase</h3>
+              </div>
+              <div class="query-box">
+                <textarea id="questionInput" rows="4" placeholder="Where is the main logic?"></textarea>
+                <select id="answerMode" aria-label="Answer mode">
+                  <option value="auto">Auto Mode</option>
+                  <option value="tree">Tree View</option>
+                  <option value="flow">Flow View</option>
+                  <option value="graph">Graph View</option>
+                  <option value="student">Student Explanation</option>
+                  <option value="debugger">Debugging Help</option>
+                  <option value="professional">Professional Summary</option>
+                </select>
+                <input id="filePathInput" placeholder="Optional file path filter">
+                <button id="askBtn" class="primary" type="button">Ask</button>
+              </div>
+              <div id="answerBox" class="answer empty">Answers will appear here.</div>
+            </div>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <script src="/frontend/app.js"></script>
+  </body>
+</html>
