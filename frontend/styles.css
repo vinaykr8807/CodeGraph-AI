@@ -525,6 +525,32 @@ select:focus {
   text-align: right;
 }
 
+.relation-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.relation-chip {
+  display: inline-flex;
+  max-width: 100%;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: #334155;
+  background: #fff;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.relation-chip.out {
+  border-color: rgba(20, 184, 166, 0.35);
+}
+
+.relation-chip.in {
+  border-color: rgba(239, 68, 68, 0.28);
+}
+
 .explanation-box {
   display: grid;
   gap: 14px;
@@ -543,15 +569,57 @@ select:focus {
 }
 
 .main-logic-list,
+.relationship-walkthrough,
+.function-walkthrough-list,
+.related-file-walkthrough-list,
 .line-explanation-list {
   display: grid;
   gap: 8px;
 }
 
 .main-logic-list h5,
+.relationship-walkthrough h5,
+.function-walkthrough-list h5,
+.related-file-walkthrough-list h5,
 .line-explanation-list h5 {
   margin: 0;
   font-size: 15px;
+}
+
+.relationship-step {
+  display: grid;
+  gap: 5px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.relationship-step span {
+  width: fit-content;
+  padding: 3px 7px;
+  border-radius: 8px;
+  background: var(--wash);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.relationship-step strong {
+  color: #0f172a;
+  overflow-wrap: anywhere;
+}
+
+.relationship-step p,
+.relationship-step em {
+  margin: 0;
+  color: #334155;
+  line-height: 1.45;
+}
+
+.relationship-step em {
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .logic-card {
@@ -568,6 +636,101 @@ select:focus {
 .logic-card em {
   color: var(--muted);
   font-size: 13px;
+}
+
+.function-walkthrough,
+.related-file-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.function-walkthrough.compact {
+  background: var(--wash);
+}
+
+.function-walkthrough-head {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.function-walkthrough-head > span {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: #0f766e;
+  color: #fff;
+  font-weight: 800;
+  font-size: 13px;
+}
+
+.function-walkthrough-head strong,
+.related-file-card > strong {
+  display: block;
+  color: #0f172a;
+  overflow-wrap: anywhere;
+}
+
+.function-walkthrough-head em {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.function-walkthrough p,
+.related-file-card p {
+  margin: 0;
+  color: #334155;
+  line-height: 1.5;
+}
+
+.function-walkthrough ul {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.function-walkthrough li {
+  margin: 4px 0;
+}
+
+.call-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.call-list span {
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.function-walkthrough pre {
+  max-height: 460px;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0f172a;
+  color: #e5e7eb;
+}
+
+.function-walkthrough code {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre;
 }
 
 .line-explanation {
@@ -897,6 +1060,24 @@ select:focus {
   border-bottom: 1px solid var(--line);
 }
 
+.mode-help {
+  display: grid;
+  gap: 3px;
+  padding: 10px;
+  border: 1px solid rgba(15, 118, 110, 0.22);
+  border-radius: 8px;
+  background: #f0fdfa;
+}
+
+.mode-help strong {
+  color: #0f172a;
+}
+
+.mode-help span {
+  color: #334155;
+  font-size: 13px;
+}
+
 .answer {
   line-height: 1.55;
 }
@@ -918,6 +1099,31 @@ select:focus {
 .answer-hero {
   background: #f0fdfa;
   border-color: rgba(15, 118, 110, 0.24);
+}
+
+.answer-mode-lens {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.answer-mode-lens > div {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.answer-mode-lens strong {
+  display: block;
+  margin-bottom: 4px;
+  color: #0f172a;
+}
+
+.answer-mode-lens p {
+  margin: 0;
+  color: #334155;
+  line-height: 1.45;
 }
 
 .answer-hero h4,

@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from typing import Optional
+from typing import Any, Optional, cast
 from urllib.parse import urlparse
 import redis
 
@@ -25,8 +25,11 @@ from app.clients import (
     encode_texts,
     embedding_status,
     faiss_index,
+    gemini_client,
+    gemini_client_error,
     github_token_configured,
     groq_client,
+    groq_client_error,
     index_storage_status,
     neo4j_driver,
     neo4j_session,
@@ -35,7 +38,15 @@ from app.clients import (
     repo_index_versions,
     save_index_state,
 )
-from app.config import GITHUB_TOKEN, GROQ_MODEL, NEO4J_DATABASE, NEO4J_URI, NEO4J_USER
+from app.config import (
+    DEFAULT_LLM_PROVIDER,
+    GEMINI_MODEL,
+    GITHUB_TOKEN,
+    GROQ_MODEL,
+    NEO4J_DATABASE,
+    NEO4J_URI,
+    NEO4J_USER,
+)
 from app.constants import (
     BUILTIN_MODULES,
     CATEGORY_COLORS,
@@ -99,6 +110,87 @@ def gh_headers():
     if github_token_configured():
         headers["Authorization"] = f"token {GITHUB_TOKEN}"
     return headers
+
+
+def normalize_llm_provider(provider: Optional[str]) -> str:
+    value = (provider or DEFAULT_LLM_PROVIDER or "gemini").strip().lower()
+    if value not in {"gemini", "groq"}:
+        return "gemini"
+    return value
+
+
+def llm_client_for(provider: Optional[str]):
+    selected = normalize_llm_provider(provider)
+    return gemini_client if selected == "gemini" else groq_client
+
+
+def llm_model_for(provider: Optional[str]) -> str:
+    selected = normalize_llm_provider(provider)
+    return GEMINI_MODEL if selected == "gemini" else GROQ_MODEL
+
+
+def llm_is_configured(provider: Optional[str]) -> bool:
+    return llm_client_for(provider) is not None
+
+
+def llm_generate_text(
+    prompt: str,
+    provider: Optional[str],
+    *,
+    max_tokens: int,
+    temperature: float,
+    system_instruction: Optional[str] = None,
+) -> str:
+    selected = normalize_llm_provider(provider)
+    client = llm_client_for(selected)
+    if client is None:
+        raise RuntimeError(f"{selected.title()} client is not configured.")
+
+    if selected == "gemini":
+        gemini_cfg = cast(dict[str, str], client)
+        combined_prompt = prompt if not system_instruction else f"{system_instruction}\n\n{prompt}"
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{llm_model_for(selected)}:generateContent",
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": gemini_cfg["api_key"],
+            },
+            json={
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": combined_prompt},
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": temperature,
+                    "maxOutputTokens": max_tokens,
+                },
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        candidates = payload.get("candidates", [])
+        if not candidates:
+            raise RuntimeError(f"Gemini returned no candidates: {payload}")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+        return text or ""
+
+    groq_cfg = cast(Any, client)
+    response = groq_cfg.chat.completions.create(
+        model=llm_model_for(selected),
+        messages=(
+            [{"role": "system", "content": system_instruction}, {"role": "user", "content": prompt}]
+            if system_instruction else
+            [{"role": "user", "content": prompt}]
+        ),
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return response.choices[0].message.content or ""
 
 
 def fetch_repo_tree(owner: str, repo: str):
@@ -378,12 +470,13 @@ def rule_based_semantic_relations(file_analyses: list) -> dict:
     }
 
 
-def groq_analyze_file(code: str, filepath: str, entities: dict) -> dict:
-    ck     = f"ga:{hashlib.md5((filepath + code[:200]).encode()).hexdigest()}"
+def llm_analyze_file(code: str, filepath: str, entities: dict, provider: Optional[str] = None) -> dict:
+    selected = normalize_llm_provider(provider)
+    ck     = f"ga:{selected}:{hashlib.md5((filepath + code[:200]).encode()).hexdigest()}"
     cached = cache_get(ck)
     if cached:
         return json.loads(cached)
-    if groq_client is None:
+    if not llm_is_configured(selected):
         return rule_based_file_analysis(filepath, entities)
 
     snippet = "\n".join(code.splitlines()[:120])
@@ -408,13 +501,7 @@ Return ONLY this JSON:
 }}"""
 
     try:
-        resp   = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=600,
-        )
-        content = resp.choices[0].message.content or ""
+        content = llm_generate_text(prompt, selected, temperature=0.1, max_tokens=600)
         raw    = content.strip().replace("```json","").replace("```","").strip()
         result = json.loads(raw)
         cache_setex(ck, 86400, json.dumps(result))
@@ -423,12 +510,13 @@ Return ONLY this JSON:
         return rule_based_file_analysis(filepath, entities)
 
 
-def groq_semantic_relations(file_analyses: list) -> dict:
-    ck     = f"sr:{hashlib.md5(json.dumps([f['path'] for f in file_analyses]).encode()).hexdigest()}"
+def llm_semantic_relations(file_analyses: list, provider: Optional[str] = None) -> dict:
+    selected = normalize_llm_provider(provider)
+    ck     = f"sr:{selected}:{hashlib.md5(json.dumps([f['path'] for f in file_analyses]).encode()).hexdigest()}"
     cached = cache_get(ck)
     if cached:
         return json.loads(cached)
-    if groq_client is None:
+    if not llm_is_configured(selected):
         return rule_based_semantic_relations(file_analyses)
 
     summary = "\n".join(
@@ -457,13 +545,7 @@ Return ONLY this JSON:
 }}"""
 
     try:
-        resp   = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=800,
-        )
-        content = resp.choices[0].message.content or ""
+        content = llm_generate_text(prompt, selected, temperature=0.1, max_tokens=800)
         raw    = content.strip().replace("```json","").replace("```","").strip()
         result = json.loads(raw)
         cache_setex(ck, 86400, json.dumps(result))
@@ -729,6 +811,7 @@ def ensure_repo_chunks(owner: str, repo: str, file_analyses: Optional[list] = No
 
 @app.post("/ingest")
 def ingest_repo(req: RepoRequest):
+    llm_provider = normalize_llm_provider(req.llm_provider)
     owner, repo   = parse_github_url(req.repo_url)
     repo_key      = f"{owner}/{repo}"
     removed_chunks = remove_repo_chunks(repo_key)
@@ -766,7 +849,7 @@ def ingest_repo(req: RepoRequest):
 
         if ext in SUPPORTED_EXTENSIONS or ftype == "docs":
             entities = extract_entities(content, path)
-            analysis = groq_analyze_file(content, path, entities)
+            analysis = llm_analyze_file(content, path, entities, llm_provider)
             build_neo4j_graph(owner, repo, path, entities, analysis, ftype)
             dataset_refs = find_dataset_references(content, dataset_paths)
             pending_dataset_links.extend((path, ref) for ref in dataset_refs)
@@ -817,7 +900,7 @@ def ingest_repo(req: RepoRequest):
     infer_cross_file_relations(owner, repo, all_entities)
     for source_path, dataset_path in pending_dataset_links:
         link_file_datasets(owner, repo, source_path, [dataset_path])
-    semantic_map = groq_semantic_relations(file_analyses)
+    semantic_map = llm_semantic_relations(file_analyses, llm_provider)
 
     with neo4j_session() as session:
         for idx, fpath in enumerate(semantic_map.get("pipeline_order",[])):
@@ -849,6 +932,8 @@ def ingest_repo(req: RepoRequest):
     return {
         "status": "success",
         "repo": repo_key,
+        "llm_provider": llm_provider,
+        "llm_model": llm_model_for(llm_provider),
         "files_processed": len(processed),
         "files_skipped": len(skipped),
         "old_chunks_removed": removed_chunks,
@@ -909,7 +994,7 @@ def view_hierarchical_tree(owner: str, repo: str, use_readme: bool = False):
         enriched.append(item)
         folder_map[folder].append(item)
 
-    readme_insight = build_readme_insight(owner, repo, repo_key, repo_index_versions.get(repo_key)) if use_readme else {"available": False}
+    readme_insight: dict[str, Any] = build_readme_insight(owner, repo, repo_key, repo_index_versions.get(repo_key)) if use_readme else {"available": False}
 
     return {
         "view": "hierarchical_tree",
@@ -1002,7 +1087,7 @@ def view_pipeline_flow(owner: str, repo: str, use_readme: bool = False):
             mermaid.append(f"    {prev} --> {nid}")
         prev = nid
 
-    readme_insight = build_readme_insight(owner, repo, repo_key, repo_index_versions.get(repo_key)) if use_readme else {"available": False}
+    readme_insight: dict[str, Any] = build_readme_insight(owner, repo, repo_key, repo_index_versions.get(repo_key)) if use_readme else {"available": False}
 
     return {
         "view": "pipeline_flow",
@@ -1076,7 +1161,8 @@ def fallback_architecture_diagram(repo_key: str, file_analyses: list, semantic_m
 
 
 @app.get("/view/architecture-diagram/{owner}/{repo}")
-def view_architecture_diagram(owner: str, repo: str, use_readme: bool = False):
+def view_architecture_diagram(owner: str, repo: str, use_readme: bool = False, llm_provider: Optional[str] = None):
+    selected = normalize_llm_provider(llm_provider)
     repo_key  = f"{owner}/{repo}"
     cached_fa = cache_get(f"fa:{repo_key}")
     cached_sm = cache_get(f"sm:{repo_key}")
@@ -1086,14 +1172,14 @@ def view_architecture_diagram(owner: str, repo: str, use_readme: bool = False):
     file_analyses = json.loads(cached_fa)
     semantic_map  = json.loads(cached_sm) if cached_sm else {}
     ensure_repo_chunks(owner, repo, file_analyses, semantic_map)
-    readme_insight = build_readme_insight(owner, repo, repo_key, repo_index_versions.get(repo_key)) if use_readme else {"available": False}
+    readme_insight: dict[str, Any] = build_readme_insight(owner, repo, repo_key, repo_index_versions.get(repo_key)) if use_readme else {"available": False}
     readme_hash = hashlib.md5(readme_insight.get("content", "").encode()).hexdigest()[:10]
-    ck = f"ad:v2:{repo_key}:{hashlib.md5(cached_fa.encode()).hexdigest()}:{use_readme}:{readme_hash}"
+    ck = f"ad:v2:{repo_key}:{selected}:{hashlib.md5(cached_fa.encode()).hexdigest()}:{use_readme}:{readme_hash}"
     cached = cache_get(ck)
     if cached:
         return json.loads(cached)
 
-    if groq_client is None:
+    if not llm_is_configured(selected):
         return fallback_architecture_diagram(repo_key, file_analyses, semantic_map, readme_insight)
 
     file_summary = "\n".join(
@@ -1154,13 +1240,7 @@ Rules:
 """
 
     try:
-        resp = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.15,
-            max_tokens=1400,
-        )
-        content = resp.choices[0].message.content or ""
+        content = llm_generate_text(prompt, selected, temperature=0.15, max_tokens=1400)
         raw = content.strip().replace("```json", "").replace("```", "").strip()
         result = json.loads(raw)
         node_ids = {node.get("id") for node in result.get("nodes", [])}
@@ -1170,7 +1250,7 @@ Rules:
         ]
         result["view"] = "architecture_diagram"
         result["repo"] = repo_key
-        result["source"] = "groq"
+        result["source"] = selected
         result["readme_insight"] = {k: v for k, v in readme_insight.items() if k != "content"}
         cache_setex(ck, 86400, json.dumps(result))
         return result
@@ -1244,7 +1324,8 @@ def fallback_presentation_graph(repo_key: str, file_analyses: list, semantic_map
 
 
 @app.get("/view/presentation-graph/{owner}/{repo}")
-def view_presentation_graph(owner: str, repo: str, use_readme: bool = False):
+def view_presentation_graph(owner: str, repo: str, use_readme: bool = False, llm_provider: Optional[str] = None):
+    selected = normalize_llm_provider(llm_provider)
     repo_key  = f"{owner}/{repo}"
     cached_fa = cache_get(f"fa:{repo_key}")
     cached_sm = cache_get(f"sm:{repo_key}")
@@ -1254,14 +1335,14 @@ def view_presentation_graph(owner: str, repo: str, use_readme: bool = False):
     file_analyses = json.loads(cached_fa)
     semantic_map  = json.loads(cached_sm) if cached_sm else {}
     ensure_repo_chunks(owner, repo, file_analyses, semantic_map)
-    readme_insight = build_readme_insight(owner, repo, repo_key, repo_index_versions.get(repo_key)) if use_readme else {"available": False}
+    readme_insight: dict[str, Any] = build_readme_insight(owner, repo, repo_key, repo_index_versions.get(repo_key)) if use_readme else {"available": False}
     readme_hash = hashlib.md5(readme_insight.get("content", "").encode()).hexdigest()[:10]
-    ck = f"pg:v2:{repo_key}:{hashlib.md5(cached_fa.encode()).hexdigest()}:{use_readme}:{readme_hash}"
+    ck = f"pg:v2:{repo_key}:{selected}:{hashlib.md5(cached_fa.encode()).hexdigest()}:{use_readme}:{readme_hash}"
     cached = cache_get(ck)
     if cached:
         return json.loads(cached)
 
-    if groq_client is None:
+    if not llm_is_configured(selected):
         return fallback_presentation_graph(repo_key, file_analyses, semantic_map, readme_insight)
 
     file_summary = "\n".join(
@@ -1324,13 +1405,7 @@ Rules:
 """
 
     try:
-        resp = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.15,
-            max_tokens=1400,
-        )
-        content = resp.choices[0].message.content or ""
+        content = llm_generate_text(prompt, selected, temperature=0.15, max_tokens=1400)
         raw = content.strip().replace("```json", "").replace("```", "").strip()
         result = json.loads(raw)
         node_ids = {node.get("id") for node in result.get("nodes", [])}
@@ -1340,7 +1415,7 @@ Rules:
         ]
         result["view"] = "presentation_graph"
         result["repo"] = repo_key
-        result["source"] = "groq"
+        result["source"] = selected
         result["readme_insight"] = {k: v for k, v in readme_insight.items() if k != "content"}
         cache_setex(ck, 86400, json.dumps(result))
         return result
@@ -1459,23 +1534,7 @@ def view_graph_relations(owner: str, repo: str, filter_type: Optional[str] = "fu
     }
 
 
-@app.get("/view/node/{owner}/{repo}")
-def view_node_detail(owner: str, repo: str, file_path: str):
-    """
-    Focus Mode — click any node to get its full detail.
-    Returns: Groq analysis, all direct outgoing/incoming relations,
-    annotated line-by-line code with function/class markers.
-    """
-    repo_key  = f"{owner}/{repo}"
-    cached_fa = cache_get(f"fa:{repo_key}")
-    if not cached_fa:
-        raise HTTPException(status_code=404, detail="Repo not ingested. Call /ingest first.")
-
-    file_analyses = json.loads(cached_fa)
-    fa = next((x for x in file_analyses if x["path"] == file_path), None)
-    if not fa:
-        raise HTTPException(status_code=404, detail="File not found.")
-
+def fetch_file_relations(repo_key: str, file_path: str) -> tuple[list[dict], list[dict]]:
     with neo4j_session() as session:
         out_res = session.run(
             "MATCH (f:File {path:$path, repo:$repo})-[r]->(n) "
@@ -1493,6 +1552,195 @@ def view_node_detail(owner: str, repo: str, file_path: str):
         )
         outgoing = [{"relation": r["rel"], "target": r["target"], "target_type": r["tgt_type"]} for r in out_res]
         incoming = [{"relation": r["rel"], "source": r["source"], "source_type": r["src_type"]} for r in in_res]
+    return outgoing, incoming
+
+
+def build_relationship_walkthrough(filepath: str, outgoing: list[dict], incoming: list[dict]) -> list[dict]:
+    basename = os.path.basename(filepath)
+    grouped: dict[str, list[dict]] = {}
+    for rel in outgoing:
+        grouped.setdefault(rel.get("relation", "RELATED_TO"), []).append(rel)
+
+    relation_copy = {
+        "IMPORTS": "These are libraries or internal modules this file needs before its own logic can run.",
+        "DEFINES": "These are the functions or classes created inside the file; read them before scanning every line.",
+        "DEPENDS_ON": "This points to repository files that this file relies on, so it is a good next file to open.",
+        "CALLS_INTO": "This shows logic jumping from the selected file into another file.",
+        "TAGGED": "These tags summarize the role this file plays in the project.",
+    }
+
+    steps = []
+    for relation, items in grouped.items():
+        targets = [item.get("target", "") for item in items[:5] if item.get("target")]
+        if not targets:
+            continue
+        readable_relation = relation.lower().replace("_", " ")
+        steps.append({
+            "kind": relation,
+            "title": f"{basename} {readable_relation} {', '.join(targets[:3])}",
+            "connected_to": targets,
+            "direction": "outgoing",
+            "explanation": relation_copy.get(
+                relation,
+                "This graph edge gives students a concrete next step beyond reading isolated lines.",
+            ),
+            "read_next": targets[0],
+        })
+
+    if incoming:
+        sources = [item.get("source", "") for item in incoming[:5] if item.get("source")]
+        if sources:
+            steps.append({
+                "kind": "USED_BY",
+                "title": f"{basename} is reached from {', '.join(sources[:3])}",
+                "connected_to": sources,
+                "direction": "incoming",
+                "explanation": "Incoming edges show who uses this file, which helps students understand why it exists.",
+                "read_next": sources[0],
+            })
+
+    return steps[:8]
+
+
+def code_window(lines: list[str], start: int, end: int, max_lines: int = 80) -> str:
+    start = max(1, start)
+    end = max(start, end)
+    snippet = lines[start - 1:min(end, start + max_lines - 1)]
+    return "\n".join(snippet)
+
+
+def explain_code_block(name: str, kind: str, code: str) -> dict:
+    stripped_lines = [line.strip() for line in code.splitlines() if line.strip()]
+    calls = []
+    assignments = []
+    decisions = []
+    returns = []
+    for line in stripped_lines:
+        if re.match(r"(if|elif|else|try|except|for|while|with)\b", line):
+            decisions.append(line)
+        elif line.startswith("return"):
+            returns.append(line)
+        elif "=" in line and not line.startswith(("#", "==")):
+            assignments.append(line)
+        for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", line):
+            call = match.group(1)
+            if call not in {"if", "for", "while", "return"} and call not in calls:
+                calls.append(call)
+
+    purpose = f"`{name}` is a {kind} block that groups one important part of this file's behavior."
+    if name.lower() in {"main", "app", "run"}:
+        purpose = f"`{name}` is the main control block students should read to understand how the screen or runtime flow starts."
+    elif "response" in name.lower() or "llm" in name.lower():
+        purpose = f"`{name}` prepares or returns AI/user-facing text, so it is central to the application behavior."
+    elif "session" in name.lower() or "state" in name.lower():
+        purpose = f"`{name}` prepares shared state so later UI or processing code can work safely."
+    elif "db" in name.lower() or "database" in name.lower():
+        purpose = f"`{name}` connects this file to stored conversation or application data."
+
+    steps = []
+    if assignments:
+        steps.append(f"Sets up values such as `{clip_text(assignments[0], 90)}`.")
+    if decisions:
+        steps.append(f"Branches or controls flow with `{clip_text(decisions[0], 90)}`.")
+    if calls:
+        steps.append(f"Calls helper logic such as `{', '.join(calls[:5])}`.")
+    if returns:
+        steps.append(f"Returns the final result with `{clip_text(returns[0], 90)}`.")
+    if not steps:
+        steps.append("Read the block top to bottom to see how this part contributes to the file.")
+
+    return {
+        "purpose": purpose,
+        "steps": steps[:5],
+        "calls": calls[:8],
+    }
+
+
+def build_function_walkthrough(filepath: str, code: str, entities: dict, limit: int = 10) -> list[dict]:
+    lines = code.splitlines()
+    items = []
+    blocks = []
+    for fn in entities.get("functions", []):
+        blocks.append({
+            "name": fn.get("name", "function"),
+            "kind": "function",
+            "line_start": fn.get("line", 1),
+            "line_end": fn.get("line", 1) + fn.get("body_lines", 0),
+            "args": fn.get("args", []),
+        })
+    for cls in entities.get("classes", []):
+        blocks.append({
+            "name": cls.get("name", "class"),
+            "kind": "class",
+            "line_start": cls.get("line", 1),
+            "line_end": cls.get("line", 1),
+            "args": [],
+        })
+
+    for block in sorted(blocks, key=lambda item: item["line_start"])[:limit]:
+        snippet = code_window(lines, block["line_start"], block["line_end"], 90)
+        explanation = explain_code_block(block["name"], block["kind"], snippet)
+        items.append({
+            "file": filepath,
+            "name": block["name"],
+            "kind": block["kind"],
+            "line_start": block["line_start"],
+            "line_end": block["line_end"],
+            "signature": f"{block['name']}({', '.join(block.get('args', []))})" if block["kind"] == "function" else block["name"],
+            "code": snippet,
+            "purpose": explanation["purpose"],
+            "steps": explanation["steps"],
+            "calls": explanation["calls"],
+        })
+    return items
+
+
+def build_related_file_walkthrough(owner: str, repo: str, outgoing: list[dict], selected_path: str) -> list[dict]:
+    related_paths = []
+    for rel in outgoing:
+        target = rel.get("target", "")
+        target_type = (rel.get("target_type") or "").lower()
+        if target and (target_type == "file" or target.endswith((".py", ".js", ".ts"))):
+            related_paths.append(target)
+
+    unique_paths = []
+    for path in related_paths:
+        if path != selected_path and path not in unique_paths:
+            unique_paths.append(path)
+
+    walkthroughs = []
+    for path in unique_paths[:3]:
+        content = fetch_file_content(owner, repo, path)
+        if not content:
+            continue
+        ents = extract_entities(content, path)
+        functions = build_function_walkthrough(path, content, ents, limit=4)
+        walkthroughs.append({
+            "file": path,
+            "summary": f"Connected file used by {os.path.basename(selected_path)}.",
+            "functions": functions,
+        })
+    return walkthroughs
+
+
+@app.get("/view/node/{owner}/{repo}")
+def view_node_detail(owner: str, repo: str, file_path: str):
+    """
+    Focus Mode — click any node to get its full detail.
+    Returns: Groq analysis, all direct outgoing/incoming relations,
+    annotated line-by-line code with function/class markers.
+    """
+    repo_key  = f"{owner}/{repo}"
+    cached_fa = cache_get(f"fa:{repo_key}")
+    if not cached_fa:
+        raise HTTPException(status_code=404, detail="Repo not ingested. Call /ingest first.")
+
+    file_analyses = json.loads(cached_fa)
+    fa = next((x for x in file_analyses if x["path"] == file_path), None)
+    if not fa:
+        raise HTTPException(status_code=404, detail="File not found.")
+
+    outgoing, incoming = fetch_file_relations(repo_key, file_path)
 
     content    = fetch_file_content(owner, repo, file_path)
     code_lines = content.splitlines() if content else []
@@ -1520,13 +1768,23 @@ def view_node_detail(owner: str, repo: str, file_path: str):
         "file_type": fa["ftype"],
         "outgoing_relations": outgoing,
         "incoming_relations": incoming,
+        "relationship_walkthrough": build_relationship_walkthrough(file_path, outgoing, incoming),
         "total_connections": len(outgoing) + len(incoming),
         "line_count": len(code_lines),
         "annotated_lines": annotated,
     }
 
 
-def fallback_file_explanation(filepath: str, code: str, entities: dict, max_lines: int, fallback_reason: str = "") -> dict:
+def fallback_file_explanation(
+    filepath: str,
+    code: str,
+    entities: dict,
+    max_lines: int,
+    fallback_reason: str = "",
+    outgoing: Optional[list[dict]] = None,
+    incoming: Optional[list[dict]] = None,
+    related_file_walkthrough: Optional[list[dict]] = None,
+) -> dict:
     lines = code.splitlines()[:max_lines]
     function_lines = {fn["line"]: fn for fn in entities.get("functions", [])}
     class_lines = {cls["line"]: cls for cls in entities.get("classes", [])}
@@ -1584,6 +1842,11 @@ def fallback_file_explanation(filepath: str, code: str, entities: dict, max_line
         "fallback_reason": fallback_reason,
         "file_path": filepath,
         "summary": f"Static walkthrough for {os.path.basename(filepath)}.",
+        "relationship_walkthrough": build_relationship_walkthrough(filepath, outgoing or [], incoming or []),
+        "outgoing_relations": outgoing or [],
+        "incoming_relations": incoming or [],
+        "function_walkthrough": build_function_walkthrough(filepath, code, entities, limit=12),
+        "related_file_walkthrough": related_file_walkthrough or [],
         "main_logic": main_logic,
         "line_notes": line_notes,
         "limit": max_lines,
@@ -1592,21 +1855,41 @@ def fallback_file_explanation(filepath: str, code: str, entities: dict, max_line
 
 
 @app.get("/explain/file/{owner}/{repo}")
-def explain_file(owner: str, repo: str, file_path: str, max_lines: int = 80):
+def explain_file(owner: str, repo: str, file_path: str, max_lines: int = 180, llm_provider: Optional[str] = None):
+    selected = normalize_llm_provider(llm_provider)
     repo_key = f"{owner}/{repo}"
     content = fetch_file_content(owner, repo, file_path)
     if not content:
         raise HTTPException(status_code=404, detail="File content not found.")
 
-    max_lines = max(30, min(max_lines, 100))
+    max_lines = max(60, min(max_lines, 220))
     entities = extract_entities(content, file_path)
-    ck = f"ex:{repo_key}:{file_path}:{hashlib.md5(content[:4000].encode()).hexdigest()}:{max_lines}"
+    outgoing, incoming = fetch_file_relations(repo_key, file_path)
+    relationship_walkthrough = build_relationship_walkthrough(file_path, outgoing, incoming)
+    function_walkthrough = build_function_walkthrough(file_path, content, entities, limit=12)
+    related_file_walkthrough = build_related_file_walkthrough(owner, repo, outgoing, file_path)
+    ck = f"ex:v2:{repo_key}:{selected}:{file_path}:{hashlib.md5(content[:6000].encode()).hexdigest()}:{max_lines}"
     cached = cache_get(ck)
     if cached:
-        return json.loads(cached)
+        result = json.loads(cached)
+        result.setdefault("relationship_walkthrough", relationship_walkthrough)
+        result.setdefault("outgoing_relations", outgoing)
+        result.setdefault("incoming_relations", incoming)
+        result.setdefault("function_walkthrough", function_walkthrough)
+        result.setdefault("related_file_walkthrough", related_file_walkthrough)
+        return result
 
-    if groq_client is None:
-        return fallback_file_explanation(file_path, content, entities, max_lines, "Groq client is not configured in the running backend process.")
+    if not llm_is_configured(selected):
+        return fallback_file_explanation(
+            file_path,
+            content,
+            entities,
+            max_lines,
+            f"{selected.title()} client is not configured in the running backend process.",
+            outgoing,
+            incoming,
+            related_file_walkthrough,
+        )
 
     numbered_code = "\n".join(
         f"{index}: {line}"
@@ -1620,6 +1903,12 @@ File: {file_path}
 Functions: {[f['name'] for f in entities.get('functions', [])]}
 Classes: {[c['name'] for c in entities.get('classes', [])]}
 Imports: {entities.get('imports', [])[:20]}
+Outgoing graph relations: {outgoing[:25]}
+Incoming graph relations: {incoming[:25]}
+Detected function walkthroughs with exact code snippets:
+{json.dumps(function_walkthrough[:8])[:5000]}
+Connected local file walkthroughs:
+{json.dumps(related_file_walkthrough[:3])[:4500]}
 
 Numbered code:
 {numbered_code}
@@ -1627,6 +1916,16 @@ Numbered code:
 Return this exact JSON shape:
 {{
   "summary": "student-friendly explanation of what this file does",
+  "relationship_walkthrough": [
+    {{
+      "kind": "IMPORTS | DEFINES | DEPENDS_ON | CALLS_INTO | USED_BY | TAGGED | RELATED",
+      "title": "short relationship title",
+      "connected_to": ["file_or_library_or_symbol"],
+      "direction": "outgoing | incoming",
+      "explanation": "how this connection helps students understand the file",
+      "read_next": "best file, symbol, or library to inspect next"
+    }}
+  ],
   "main_logic": [
     {{
       "name": "function_or_block_name",
@@ -1634,6 +1933,36 @@ Return this exact JSON shape:
       "line_start": 1,
       "line_end": 5,
       "why_it_matters": "why students should look here"
+    }}
+  ],
+  "function_walkthrough": [
+    {{
+      "file": "{file_path}",
+      "name": "function_or_class_name",
+      "kind": "function | class",
+      "line_start": 1,
+      "line_end": 20,
+      "signature": "function_name(args)",
+      "code": "exact code snippet from the provided function walkthrough",
+      "purpose": "plain explanation of this complete block",
+      "steps": ["what this block does first", "what it calls next", "what it returns or changes"],
+      "calls": ["helper_or_api_name"]
+    }}
+  ],
+  "related_file_walkthrough": [
+    {{
+      "file": "connected_file.py",
+      "summary": "why this file matters to the selected file",
+      "functions": [
+        {{
+          "name": "function_name",
+          "signature": "function_name(args)",
+          "code": "short exact snippet",
+          "purpose": "what this connected function contributes",
+          "steps": ["step 1", "step 2"],
+          "calls": ["helper_name"]
+        }}
+      ]
     }}
   ],
   "line_notes": [
@@ -1647,6 +1976,12 @@ Return this exact JSON shape:
 }}
 
 Rules:
+- Explain repository relationships before individual lines.
+- Make function_walkthrough the most useful student section. It should feel like reading analyst.py/researcher.py/writer.py examples: code block, purpose, and steps.
+- Use exact snippets from Detected function walkthroughs and Connected local file walkthroughs; do not invent code.
+- Include connected local files when they explain the selected file's real workflow.
+- Use outgoing/incoming graph relations to show how this file fits into the visual tree and graph.
+- Prefer cross-file edges, imports, defined functions/classes, and incoming callers over generic line descriptions.
 - Include a line_notes entry for every non-empty line shown.
 - Use simple student-friendly language.
 - Mention how data moves through the file.
@@ -1655,24 +1990,32 @@ Rules:
 """
 
     try:
-        resp = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=6000,
-        )
-        content_text = resp.choices[0].message.content or ""
+        content_text = llm_generate_text(prompt, selected, temperature=0.1, max_tokens=9000)
         raw = content_text.strip().replace("```json", "").replace("```", "").strip()
         result = json.loads(raw)
         result["view"] = "file_explanation"
-        result["source"] = "groq"
+        result["source"] = selected
         result["file_path"] = file_path
         result["limit"] = max_lines
         result["total_lines"] = len(content.splitlines())
+        result.setdefault("relationship_walkthrough", relationship_walkthrough)
+        result.setdefault("function_walkthrough", function_walkthrough)
+        result.setdefault("related_file_walkthrough", related_file_walkthrough)
+        result["outgoing_relations"] = outgoing
+        result["incoming_relations"] = incoming
         cache_setex(ck, 86400, json.dumps(result))
         return result
     except Exception as exc:
-        return fallback_file_explanation(file_path, content, entities, max_lines, str(exc))
+        return fallback_file_explanation(
+            file_path,
+            content,
+            entities,
+            max_lines,
+            str(exc),
+            outgoing,
+            incoming,
+            related_file_walkthrough,
+        )
 
 
 QUERY_MODES = {"auto", "student", "tree", "flow", "graph", "debugger", "professional", "architect"}
@@ -1898,19 +2241,32 @@ def query_style_rules(answer_style: str) -> str:
     rules = {
         "tree": (
             "Use Tree View. Organize the answer by folders/files first. "
-            "Fill tree_view with the most relevant directories or files and explain why each matters."
+            "Make tree_view the main output. Explain that this mode answers WHERE code lives. "
+            "Keep flow_view and graph_view empty unless the user asks for them."
         ),
         "flow": (
             "Use Flow View. Explain the runtime/data/control sequence from entry point to output. "
-            "Fill flow_view and logic_flow with ordered steps."
+            "Make flow_view and logic_flow the main output. Explain that this mode answers WHAT RUNS NEXT. "
+            "Keep tree_view and graph_view empty unless needed."
         ),
         "graph": (
             "Use Graph View. Explain dependencies, calls, imports, and connected components. "
-            "Fill graph_view.nodes and graph_view.edges with the relevant relationships."
+            "Make graph_view.nodes and graph_view.edges the main output. Explain that this mode answers HOW FILES CONNECT. "
+            "Keep tree_view, flow_view, and logic_flow empty."
         ),
-        "student": "Use Student Explanation. Teach the idea simply, step by step, without losing technical accuracy.",
-        "debugger": "Use Debugging Help. Identify likely files, symbols, failure points, and checks to run next.",
-        "professional": "Use Professional Summary. Be concise, precise, and review-oriented.",
+        "student": (
+            "Use Student Explanation. Teach the idea simply, step by step, without losing technical accuracy. "
+            "Explain that this mode answers WHAT IT MEANS for a beginner. Prefer key_points, logic_flow, important_files, and next_steps."
+        ),
+        "debugger": (
+            "Use Debugging Help. Identify likely files, symbols, failure points, and checks to run next. "
+            "Explain that this mode answers WHAT TO CHECK IF IT BREAKS. Prefer code_pointers and next_steps over broad architecture sections."
+        ),
+        "professional": (
+            "Use Professional Summary. Be concise, precise, and review-oriented. "
+            "Explain that this mode answers WHAT TO SAY IN REVIEW. Prefer short_answer, key_points, important_files, and code_pointers. "
+            "Do not include tree_view, flow_view, or graph_view unless essential."
+        ),
     }
     return rules.get(answer_style, rules["professional"])
 
@@ -1925,6 +2281,7 @@ def parse_llm_structured_output(raw_text: str) -> dict:
 
 
 def local_query_answer(req: QueryRequest, answer_style: str, chunks: list, file_analyses: list, semantic_map: dict, reason: str) -> dict:
+    provider_name = normalize_llm_provider(req.llm_provider).title()
     important_files = []
     seen_files = set()
     for chunk in chunks:
@@ -1998,13 +2355,13 @@ def local_query_answer(req: QueryRequest, answer_style: str, chunks: list, file_
         "answer_type": answer_style,
         "headline": "Local Codebase Answer",
         "short_answer": (
-            f"I could not use Groq for this question ({reason}). "
+            f"I could not use {provider_name} for this question ({reason}). "
             "Here is a local answer from the indexed repository chunks, README, tree, flow, and graph metadata."
         ),
         "key_points": [
-            "Groq was unavailable or rate-limited, so this answer avoids another paid LLM call.",
+            f"{provider_name} was unavailable or rate-limited, so this answer avoids another paid LLM call.",
             "The listed files came from the local semantic index and repository analysis.",
-            "Ask again after the Groq limit resets for a fuller natural-language explanation.",
+            f"Ask again after the {provider_name} limit resets for a fuller natural-language explanation.",
         ],
         "important_files": important_files,
         "logic_flow": [
@@ -2030,7 +2387,7 @@ def local_query_answer(req: QueryRequest, answer_style: str, chunks: list, file_
         "next_steps": [
             "Open the important files shown here.",
             "Use Tree, Flow, or Graph mode to inspect the same answer visually.",
-            "Retry the Ask request after Groq rate limit reset for a fuller LLM explanation.",
+            f"Retry the Ask request after the {provider_name} rate limit reset for a fuller LLM explanation.",
         ],
     }
     return structured_answer
@@ -2111,12 +2468,24 @@ def ensure_mode_answer(structured_answer: dict, req: QueryRequest, answer_style:
         answer["tree_view"] = []
         answer["flow_view"] = []
         answer["logic_flow"] = []
+    elif answer_style == "professional":
+        answer["tree_view"] = []
+        answer["flow_view"] = []
+        answer["logic_flow"] = []
+        answer["graph_view"] = {"nodes": [], "edges": []}
+        answer["next_steps"] = []
+    elif answer_style == "debugger":
+        answer["tree_view"] = []
+        answer["flow_view"] = []
+        answer["logic_flow"] = []
+        answer["graph_view"] = {"nodes": [], "edges": []}
 
     return answer
 
 
 @app.post("/query")
 def query_repo(req: QueryRequest):
+    llm_provider = normalize_llm_provider(req.llm_provider)
     owner, repo = parse_github_url(req.repo_url)
     repo_key = f"{owner}/{repo}"
     file_analyses, semantic_map = get_cached_repo_maps(repo_key)
@@ -2124,7 +2493,7 @@ def query_repo(req: QueryRequest):
     active_ingest_id = repo_index_versions.get(repo_key)
     requested_mode = normalize_query_mode(req.answer_mode)
     answer_style = infer_query_mode(req.question, requested_mode)
-    ck = f"q:v3:{repo_key}:{active_ingest_id or 'unknown'}:{answer_style}:{req.question}:{req.file_path or ''}"
+    ck = f"q:v4:{repo_key}:{active_ingest_id or 'unknown'}:{llm_provider}:{answer_style}:{req.question}:{req.file_path or ''}"
     cached = cache_get(ck)
     if cached:
         return json.loads(cached)
@@ -2169,14 +2538,14 @@ def query_repo(req: QueryRequest):
         for c in chunks
     )
 
-    if groq_client is None:
+    if not llm_is_configured(llm_provider):
         structured_answer = local_query_answer(
             req,
             answer_style,
             chunks,
             file_analyses,
             semantic_map,
-            "Groq is not configured",
+            f"{llm_provider.title()} is not configured",
         )
         structured_answer = ensure_mode_answer(
             structured_answer,
@@ -2289,24 +2658,21 @@ Rules:
 """
 
     try:
-        resp = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": (
-                    "Return strict TOML for a professional codebase Q&A UI. "
-                    "Do not include markdown fences or prose outside TOML."
-                )},
-                {"role": "user", "content": prompt},
-            ],
+        answer = llm_generate_text(
+            prompt,
+            llm_provider,
+            system_instruction=(
+                "Return strict TOML for a professional codebase Q&A UI. "
+                "Do not include markdown fences or prose outside TOML."
+            ),
             temperature=0.2,
             max_tokens=1800,
         )
-        answer = resp.choices[0].message.content or ""
         structured_answer = parse_llm_structured_output(answer)
     except Exception as exc:
         reason = str(exc)
         if "rate limit" in reason.lower() or "429" in reason:
-            reason = "Groq rate limit reached"
+            reason = f"{llm_provider.title()} rate limit reached"
         structured_answer = local_query_answer(req, answer_style, chunks, file_analyses, semantic_map, reason)
     structured_answer = ensure_mode_answer(structured_answer, req, answer_style, chunks, file_analyses, semantic_map)
     display_answer = structured_answer.get("short_answer", "")
@@ -2316,6 +2682,8 @@ Rules:
         "structured_answer": structured_answer,
         "sources": list({c["file"] for c in chunks}),
         "stages_covered": list({c["pipeline_stage"] for c in chunks}),
+        "llm_provider": llm_provider,
+        "llm_model": llm_model_for(llm_provider),
         "answer_mode": answer_style,
     }
     cache_setex(ck, 1800, json.dumps(result))
@@ -2396,8 +2764,13 @@ def health():
         "faiss_chunks": faiss_index.ntotal,
         "chunk_store_size": len(chunk_store),
         "index_storage": index_storage_status(),
+        "default_llm_provider": normalize_llm_provider(DEFAULT_LLM_PROVIDER),
+        "gemini_configured": gemini_client is not None,
+        "gemini_model": GEMINI_MODEL,
+        "gemini_error": gemini_client_error,
         "groq_configured": groq_client is not None,
         "groq_model": GROQ_MODEL,
+        "groq_error": groq_client_error,
         "embedding": embedding_status(),
         "github_token_configured": github_token_configured(),
         "redis_connected": redis_ok,

@@ -2,13 +2,17 @@ const state = {
   owner: "",
   repo: "",
   repoUrl: "",
+  llmProvider: "gemini",
+  llmProviderInitialized: false,
   activeView: "tree",
   selectedFilePath: "",
+  selectedNodeDetail: null,
 };
 
 const els = {
   apiBase: document.querySelector("#apiBase"),
   repoUrl: document.querySelector("#repoUrl"),
+  llmProvider: document.querySelector("#llmProvider"),
   healthBtn: document.querySelector("#healthBtn"),
   ingestBtn: document.querySelector("#ingestBtn"),
   loadTreeBtn: document.querySelector("#loadTreeBtn"),
@@ -34,8 +38,54 @@ const els = {
   graphStats: document.querySelector("#graphStats"),
   questionInput: document.querySelector("#questionInput"),
   answerMode: document.querySelector("#answerMode"),
+  answerModeHelp: document.querySelector("#answerModeHelp"),
   filePathInput: document.querySelector("#filePathInput"),
   answerBox: document.querySelector("#answerBox"),
+};
+
+const answerModeInfo = {
+  auto: {
+    title: "Auto chooses the lens",
+    focus: "Let CodeGraph decide whether the question needs structure, execution flow, relationships, explanation, debugging, or summary.",
+    student: "Use this when you are not sure which view will help.",
+    output: "The answer may use one of the focused modes below.",
+  },
+  tree: {
+    title: "Tree means location",
+    focus: "Shows where the answer lives in folders and files.",
+    student: "Think: Which file should I open first?",
+    output: "Best for finding main files, modules, folders, and project structure.",
+  },
+  flow: {
+    title: "Flow means sequence",
+    focus: "Shows what happens first, next, and last during runtime or data movement.",
+    student: "Think: After this function runs, where does control or data go?",
+    output: "Best for request flow, app startup, pipelines, and user journeys.",
+  },
+  graph: {
+    title: "Graph means relationships",
+    focus: "Shows imports, calls, dependencies, and connected symbols.",
+    student: "Think: Why are these files connected?",
+    output: "Best for understanding app.py -> service.py, caller/callee, and dependency links.",
+  },
+  student: {
+    title: "Student means teaching",
+    focus: "Explains the idea in plain language before naming files and functions.",
+    student: "Think: What is the concept, then where is it implemented?",
+    output: "Best for beginner-friendly explanations and study notes.",
+  },
+  debugger: {
+    title: "Debug means checks",
+    focus: "Points to likely failure locations and what to inspect first.",
+    student: "Think: If this breaks, where should I look and what should I test?",
+    output: "Best for errors, bugs, missing config, bad data, or failing integrations.",
+  },
+  professional: {
+    title: "Professional means compact review",
+    focus: "Gives a concise engineering summary with main files and responsibilities.",
+    student: "Think: What would I say in a project review or viva?",
+    output: "Best for quick overview, documentation, and presentation prep.",
+  },
 };
 
 function defaultApiBase() {
@@ -47,6 +97,12 @@ function defaultApiBase() {
 
 function apiBase() {
   return (els.apiBase.value.trim() || defaultApiBase()).replace(/\/$/, "");
+}
+
+function currentLlmProvider() {
+  const value = els.llmProvider?.value || state.llmProvider || "gemini";
+  state.llmProvider = value;
+  return value;
 }
 
 function setStatus(message, isError = false) {
@@ -104,10 +160,16 @@ async function request(path, options = {}) {
 }
 
 function renderHealth(data) {
+  if (els.llmProvider && data.default_llm_provider && !state.llmProviderInitialized) {
+    els.llmProvider.value = data.default_llm_provider;
+    state.llmProvider = data.default_llm_provider;
+    state.llmProviderInitialized = true;
+  }
   const items = [
     { label: "Redis", good: data.redis_connected, value: data.redis_connected ? "OK" : "Off" },
     { label: "Neo4j", good: data.neo4j_connected, value: data.neo4j_connected ? "OK" : "Off" },
     { label: "GitHub", good: data.github_token_configured, value: data.github_token_configured ? "OK" : "Off" },
+    { label: "Gemini", good: data.gemini_configured, value: data.gemini_configured ? "OK" : "Off" },
     { label: "Groq", good: data.groq_configured, value: data.groq_configured ? "OK" : "Off" },
     { label: "Chunks", good: Number(data.faiss_chunks ?? 0) > 0, value: String(data.faiss_chunks ?? 0) },
   ];
@@ -121,17 +183,18 @@ async function checkHealth() {
   const data = await request("/health");
   renderHealth(data);
   const neo4jNote = data.neo4j_connected ? "Neo4j connected" : `Neo4j offline: ${data.neo4j_error || "check .env credentials"}`;
-  setStatus(`Backend OK. Redis ${data.redis_connected ? "connected" : "offline"}, ${neo4jNote}.`);
+  setStatus(`Backend OK. Provider default is ${data.default_llm_provider || "gemini"}. Redis ${data.redis_connected ? "connected" : "offline"}, ${neo4jNote}.`);
 }
 
 async function ingestRepo() {
   rememberRepo();
-  setStatus("Analyzing repository. This can take a little while...");
+  const llmProvider = currentLlmProvider();
+  setStatus(`Analyzing repository with ${llmProvider}... This can take a little while...`);
   const data = await request("/ingest", {
     method: "POST",
-    body: JSON.stringify({ repo_url: state.repoUrl }),
+    body: JSON.stringify({ repo_url: state.repoUrl, llm_provider: llmProvider }),
   });
-  setStatus(`Processed ${data.files_processed} files, skipped ${data.files_skipped}, indexed ${data.repo_chunks ?? data.chunks_indexed ?? 0} chunks.`);
+  setStatus(`Processed ${data.files_processed} files with ${data.llm_provider || llmProvider}, skipped ${data.files_skipped}, indexed ${data.repo_chunks ?? data.chunks_indexed ?? 0} chunks.`);
   try {
     renderHealth(await request("/health"));
   } catch {
@@ -330,6 +393,8 @@ function renderNode(data) {
   const outgoing = data.outgoing_relations || [];
   const incoming = data.incoming_relations || [];
   const lines = data.annotated_lines || [];
+  state.selectedNodeDetail = data;
+  const relationPreview = [...outgoing.slice(0, 5), ...incoming.slice(0, 3)];
 
   els.nodeDetail.className = "detail";
   els.nodeDetail.innerHTML = `
@@ -351,7 +416,13 @@ function renderNode(data) {
       <section class="detail-block">
         <h4>Relations</h4>
         <p>${outgoing.length} outgoing, ${incoming.length} incoming.</p>
-        <p>${escapeHtml(outgoing.slice(0, 6).map((r) => `${r.relation} ${r.target}`).join(" | ") || "No outgoing relations.")}</p>
+        <div class="relation-chip-list">
+          ${relationPreview.map((r) => {
+            const label = r.target || r.source || "unknown";
+            const direction = r.target ? "out" : "in";
+            return `<span class="relation-chip ${direction}">${escapeHtml(r.relation)} ${escapeHtml(label)}</span>`;
+          }).join("") || "<span class=\"relation-chip\">No direct graph relations found.</span>"}
+        </div>
       </section>
       <section class="detail-block">
         <h4>Code</h4>
@@ -366,7 +437,7 @@ function renderNode(data) {
       </section>
       <section class="detail-block">
         <h4>Student Walkthrough</h4>
-        <div id="explanationBox" class="explanation-box empty">Click Explain Code to get line-by-line guidance for this file.</div>
+        <div id="explanationBox" class="explanation-box empty">Click Explain Code to connect this file to the repository, then inspect the important lines.</div>
       </section>
     </div>
   `;
@@ -380,10 +451,11 @@ async function loadFileExplanation(path) {
   ensureRepo();
   const box = document.querySelector("#explanationBox");
   if (!box) return;
+  const llmProvider = currentLlmProvider();
   box.className = "explanation-box";
   box.textContent = "Generating student walkthrough...";
-  setStatus(`Explaining ${path} with Groq...`);
-  const data = await request(`/explain/file/${state.owner}/${state.repo}?file_path=${encodeURIComponent(path)}&max_lines=80`);
+  setStatus(`Explaining ${path} with ${llmProvider}...`);
+  const data = await request(`/explain/file/${state.owner}/${state.repo}?file_path=${encodeURIComponent(path)}&max_lines=220&llm_provider=${encodeURIComponent(llmProvider)}`);
   renderFileExplanation(data);
   setStatus(`Walkthrough ready from ${data.source || "backend"}.`);
 }
@@ -393,6 +465,9 @@ function renderFileExplanation(data) {
   if (!box) return;
   const mainLogic = data.main_logic || [];
   const notes = data.line_notes || [];
+  const relationshipWalkthrough = data.relationship_walkthrough || buildRelationshipWalkthrough(state.selectedNodeDetail);
+  const functionWalkthrough = data.function_walkthrough || [];
+  const relatedFileWalkthrough = data.related_file_walkthrough || [];
   box.className = "explanation-box";
   box.innerHTML = `
     <div class="walkthrough-summary">
@@ -401,6 +476,18 @@ function renderFileExplanation(data) {
       ${data.fallback_reason ? `<span class="badge error-badge">Fallback: ${escapeHtml(data.fallback_reason.slice(0, 90))}</span>` : ""}
       <span class="badge">${notes.length} explained lines</span>
       <span class="badge">${data.limit || 0}/${data.total_lines || 0} lines scanned</span>
+      <span class="badge">${functionWalkthrough.length} code blocks</span>
+    </div>
+    <div class="relationship-walkthrough">
+      <h5>Repository Connections To Understand First</h5>
+      ${relationshipWalkthrough.map((item) => `
+        <article class="relationship-step">
+          <span>${escapeHtml(item.kind || item.relation || "connection")}</span>
+          <strong>${escapeHtml(item.title || item.connected_to || "Connected code")}</strong>
+          <p>${escapeHtml(item.explanation || item.why_it_matters || "")}</p>
+          ${item.read_next ? `<em>Read next: ${escapeHtml(item.read_next)}</em>` : ""}
+        </article>
+      `).join("") || "<p>No direct repository connections were found for this file.</p>"}
     </div>
     <div class="main-logic-list">
       <h5>Main Logic To Read First</h5>
@@ -412,8 +499,24 @@ function renderFileExplanation(data) {
         </button>
       `).join("") || "<p>No main blocks detected.</p>"}
     </div>
+    <div class="function-walkthrough-list">
+      <h5>Code Block Walkthrough</h5>
+      ${functionWalkthrough.map((item, index) => renderFunctionWalkthroughCard(item, index + 1)).join("") || "<p>No function walkthroughs returned.</p>"}
+    </div>
+    ${relatedFileWalkthrough.length ? `
+      <div class="related-file-walkthrough-list">
+        <h5>Connected Files To Read Next</h5>
+        ${relatedFileWalkthrough.map((file) => `
+          <article class="related-file-card">
+            <strong>${escapeHtml(file.file || "connected file")}</strong>
+            <p>${escapeHtml(file.summary || "")}</p>
+            ${(file.functions || []).map((fn, index) => renderFunctionWalkthroughCard({ ...fn, file: file.file }, index + 1, true)).join("")}
+          </article>
+        `).join("")}
+      </div>
+    ` : ""}
     <div class="line-explanation-list">
-      <h5>Line By Line Explanation</h5>
+      <h5>Line Notes After The Connections</h5>
       ${notes.map((note) => `
         <article class="line-explanation" id="explain-line-${escapeHtml(note.line)}">
           <div class="line-explanation-code">
@@ -434,11 +537,88 @@ function renderFileExplanation(data) {
   });
 }
 
+function renderFunctionWalkthroughCard(item, index, compact = false) {
+  const steps = item.steps || [];
+  const calls = item.calls || [];
+  return `
+    <article class="function-walkthrough ${compact ? "compact" : ""}" id="walkthrough-block-${escapeHtml(index)}">
+      <div class="function-walkthrough-head">
+        <span>${escapeHtml(index)}</span>
+        <div>
+          <strong>${escapeHtml(item.signature || item.name || "code block")}</strong>
+          <em>${escapeHtml(item.file || "")}${item.line_start ? ` | Lines ${escapeHtml(item.line_start)}-${escapeHtml(item.line_end || item.line_start)}` : ""}</em>
+        </div>
+      </div>
+      <p>${escapeHtml(item.purpose || "")}</p>
+      ${steps.length ? `<ul>${steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ul>` : ""}
+      ${calls.length ? `<div class="call-list">${calls.slice(0, 8).map((call) => `<span>${escapeHtml(call)}</span>`).join("")}</div>` : ""}
+      ${item.code ? `<pre><code>${escapeHtml(item.code)}</code></pre>` : ""}
+    </article>
+  `;
+}
+
+function buildRelationshipWalkthrough(nodeDetail) {
+  if (!nodeDetail) return [];
+  const outgoing = nodeDetail.outgoing_relations || [];
+  const incoming = nodeDetail.incoming_relations || [];
+  const basename = nodeDetail.name || nodeDetail.path || "this file";
+  const steps = [];
+  const groupedOutgoing = outgoing.reduce((acc, relation) => {
+    const key = relation.relation || "RELATED_TO";
+    acc[key] = acc[key] || [];
+    acc[key].push(relation);
+    return acc;
+  }, {});
+
+  Object.entries(groupedOutgoing).forEach(([relation, items]) => {
+    const names = items.slice(0, 4).map((item) => item.target).filter(Boolean);
+    steps.push({
+      kind: relation,
+      title: `${basename} ${relation.toLowerCase().replaceAll("_", " ")} ${names.join(", ")}`,
+      explanation: relationExplanation(relation, names, "outgoing"),
+      read_next: names[0] || "",
+    });
+  });
+
+  if (incoming.length) {
+    const names = incoming.slice(0, 4).map((item) => item.source).filter(Boolean);
+    steps.push({
+      kind: "USED_BY",
+      title: `${basename} is reached from ${names.join(", ")}`,
+      explanation: "Incoming relations show which files or symbols depend on this file, so students can trace the caller side too.",
+      read_next: names[0] || "",
+    });
+  }
+
+  return steps.slice(0, 8);
+}
+
+function relationExplanation(relation, names, direction) {
+  const targetText = names.length ? names.join(", ") : "connected nodes";
+  if (relation === "IMPORTS") {
+    return `These imports are the outside tools ${direction === "outgoing" ? "this file uses" : "that point here"}: ${targetText}.`;
+  }
+  if (relation === "DEFINES") {
+    return `These are the functions or classes declared inside the file. Start here before reading every line.`;
+  }
+  if (relation === "DEPENDS_ON") {
+    return `This file depends on repository code in ${targetText}. Open those files to follow the data path.`;
+  }
+  if (relation === "CALLS_INTO") {
+    return `This file calls logic implemented in ${targetText}. That edge explains why the files belong together.`;
+  }
+  if (relation === "TAGGED") {
+    return `These tags summarize the file's role in the project: ${targetText}.`;
+  }
+  return `This graph edge connects the selected file with ${targetText}. Use it as the next reading step.`;
+}
+
 async function loadPipeline() {
   ensureRepo();
+  const llmProvider = currentLlmProvider();
   const useReadme = els.flowReadmeToggle?.checked ? "true" : "false";
-  setStatus(useReadme === "true" ? "Generating architecture flow with README context..." : "Generating architecture flow with Groq...");
-  const data = await request(`/view/architecture-diagram/${state.owner}/${state.repo}?use_readme=${useReadme}`);
+  setStatus(useReadme === "true" ? `Generating architecture flow with README context using ${llmProvider}...` : `Generating architecture flow with ${llmProvider}...`);
+  const data = await request(`/view/architecture-diagram/${state.owner}/${state.repo}?use_readme=${useReadme}&llm_provider=${encodeURIComponent(llmProvider)}`);
   els.pipelineDescription.textContent = data.summary || "";
   renderArchitectureDiagram(data);
   renderPipelineLegend(data);
@@ -664,11 +844,12 @@ function renderArchitectureDiagram(data) {
 
 async function loadGraph() {
   ensureRepo();
+  const llmProvider = currentLlmProvider();
   const useReadme = els.graphReadmeToggle?.checked ? "true" : "false";
-  setStatus(useReadme === "true" ? "Generating presentation graph with README context..." : "Generating presentation graph...");
+  setStatus(useReadme === "true" ? `Generating presentation graph with README context using ${llmProvider}...` : `Generating presentation graph with ${llmProvider}...`);
   const filter = els.graphFilter.value;
   if (filter === "presentation") {
-    const data = await request(`/view/presentation-graph/${state.owner}/${state.repo}?use_readme=${useReadme}`);
+    const data = await request(`/view/presentation-graph/${state.owner}/${state.repo}?use_readme=${useReadme}&llm_provider=${encodeURIComponent(llmProvider)}`);
     renderPresentationGraph(data);
     els.graphStats.innerHTML = `
       <span>${escapeHtml(data.nodes?.length || 0)} components, ${escapeHtml(data.edges?.length || 0)} relationships. Source: ${escapeHtml(data.source || "backend")}.</span>
@@ -1359,6 +1540,7 @@ function drawRawGraphNode(svg, pos, label, sublabel, color) {
 
 async function askQuestion() {
   ensureRepo();
+  const llmProvider = currentLlmProvider();
   const mode = els.answerMode.value;
   const rawQuestion = els.questionInput.value.trim();
   if (!rawQuestion) {
@@ -1373,6 +1555,7 @@ async function askQuestion() {
     question: rawQuestion,
     answer_mode: mode,
     file_path: els.filePathInput.value.trim() || null,
+    llm_provider: llmProvider,
   };
   const data = await request("/query", {
     method: "POST",
@@ -1392,119 +1575,172 @@ function renderAskAnswer(data) {
     code_pointers: [],
     next_steps: [],
   };
+  const answerType = answer.answer_type || data.answer_mode || "professional";
+  const modeInfo = answerModeInfo[answerType] || answerModeInfo.professional;
   const treeItems = answer.tree_view || [];
   const flowItems = (answer.flow_view || []).length ? answer.flow_view : (answer.logic_flow || []);
   const graph = answer.graph_view || {};
   const graphNodes = graph.nodes || [];
   const graphEdges = graph.edges || [];
-  els.answerBox.className = "answer answer-card";
-  els.answerBox.innerHTML = `
-    <section class="answer-hero">
-      <span class="badge">${escapeHtml(answer.answer_type || "answer")}</span>
-      <h4>${escapeHtml(answer.headline || "Codebase Answer")}</h4>
-      <p>${escapeHtml(answer.short_answer || data.answer || "")}</p>
-    </section>
 
+  const keyPointsSection = () => `
     <section class="answer-section">
       <h5>Key Points</h5>
       <ul>${(answer.key_points || []).map((point) => `<li>${escapeHtml(point)}</li>`).join("") || "<li>No key points returned.</li>"}</ul>
     </section>
+  `;
 
-    ${treeItems.length ? `
-      <section class="answer-section">
-        <h5>Tree View</h5>
-        <div class="answer-tree">
-          ${treeItems.map((item) => `
-            <article class="answer-tree-item">
-              <strong>${escapeHtml(item.path || item.folder || "root")}</strong>
-              <span>${escapeHtml(item.role || item.reason || "")}</span>
-              ${(item.files || []).length ? `<em>${escapeHtml(item.files.join(", "))}</em>` : ""}
-            </article>
-          `).join("")}
-        </div>
-      </section>
-    ` : ""}
-
-    ${flowItems.length ? `
-      <section class="answer-section">
-        <h5>Flow View</h5>
-        <div class="flow-steps">
-          ${flowItems.map((step, index) => `
-            <article class="flow-step">
-              <span>${escapeHtml(step.step || index + 1)}</span>
-              <div>
-                <strong>${escapeHtml(step.title || step.stage || "Step")}</strong>
-                <em>${escapeHtml(Array.isArray(step.files) ? step.files.join(" -> ") : (step.file || step.files || ""))}</em>
-                <p>${escapeHtml(step.explanation || step.action || "")}</p>
-              </div>
-            </article>
-          `).join("")}
-        </div>
-      </section>
-    ` : ""}
-
-    ${graphNodes.length || graphEdges.length ? `
-      <section class="answer-section">
-        <h5>Graph View</h5>
-        <div class="answer-graph-grid">
-          <div>
-            <strong>Nodes</strong>
-            ${(graphNodes || []).map((node) => `
-              <article class="file-chip">
-                <strong>${escapeHtml(node.label || node.id || node.file)}</strong>
-                <span>${escapeHtml(node.type || node.kind || "")}</span>
-                <p>${escapeHtml(node.reason || node.role || "")}</p>
-              </article>
-            `).join("") || "<p>No nodes returned.</p>"}
-          </div>
-          <div>
-            <strong>Edges</strong>
-            ${(graphEdges || []).map((edge) => `
-              <article class="file-chip">
-                <strong>${escapeHtml(edge.source || edge.from)} -> ${escapeHtml(edge.target || edge.to)}</strong>
-                <span>${escapeHtml(edge.relation || edge.label || "")}</span>
-                <p>${escapeHtml(edge.reason || "")}</p>
-              </article>
-            `).join("") || "<p>No edges returned.</p>"}
-          </div>
-        </div>
-      </section>
-    ` : ""}
-
-    <section class="answer-grid">
-      <div class="answer-section">
-        <h5>Important Files</h5>
-        ${(answer.important_files || []).map((file) => `
-          <article class="file-chip">
-            <strong>${escapeHtml(file.path)}</strong>
-            <span>${escapeHtml(file.stage || "")}</span>
-            <p>${escapeHtml(file.why || "")}</p>
-            ${(file.symbols || []).length ? `<em>${escapeHtml(file.symbols.join(", "))}</em>` : ""}
+  const treeSection = () => treeItems.length ? `
+    <section class="answer-section mode-focus">
+      <h5>Tree View</h5>
+      <div class="answer-tree">
+        ${treeItems.map((item) => `
+          <article class="answer-tree-item">
+            <strong>${escapeHtml(item.path || item.folder || "root")}</strong>
+            <span>${escapeHtml(item.role || item.reason || "")}</span>
+            ${(item.files || []).length ? `<em>${escapeHtml(item.files.join(", "))}</em>` : ""}
           </article>
-        `).join("") || "<p>No files returned.</p>"}
-      </div>
-
-      <div class="answer-section">
-        <h5>Code Pointers</h5>
-        ${(answer.code_pointers || []).map((pointer) => `
-          <article class="file-chip">
-            <strong>${escapeHtml(pointer.symbol || pointer.file)}</strong>
-            <span>${escapeHtml(pointer.file || "")}</span>
-            <p>${escapeHtml(pointer.reason || "")}</p>
-          </article>
-        `).join("") || "<p>No code pointers returned.</p>"}
+        `).join("")}
       </div>
     </section>
+  ` : "";
 
+  const flowSection = () => flowItems.length ? `
+    <section class="answer-section mode-focus">
+      <h5>Flow View</h5>
+      <div class="flow-steps">
+        ${flowItems.map((step, index) => `
+          <article class="flow-step">
+            <span>${escapeHtml(step.step || index + 1)}</span>
+            <div>
+              <strong>${escapeHtml(step.title || step.stage || "Step")}</strong>
+              <em>${escapeHtml(Array.isArray(step.files) ? step.files.join(" -> ") : (step.file || step.files || ""))}</em>
+              <p>${escapeHtml(step.explanation || step.action || "")}</p>
+            </div>
+          </article>
+        `).join("")}
+      </div>
+    </section>
+  ` : "";
+
+  const graphSection = () => graphNodes.length || graphEdges.length ? `
+    <section class="answer-section mode-focus">
+      <h5>Graph View</h5>
+      <div class="answer-graph-grid">
+        <div>
+          <strong>Nodes</strong>
+          ${(graphNodes || []).map((node) => `
+            <article class="file-chip">
+              <strong>${escapeHtml(node.label || node.id || node.file)}</strong>
+              <span>${escapeHtml(node.type || node.kind || "")}</span>
+              <p>${escapeHtml(node.reason || node.role || "")}</p>
+            </article>
+          `).join("") || "<p>No nodes returned.</p>"}
+        </div>
+        <div>
+          <strong>Edges</strong>
+          ${(graphEdges || []).map((edge) => `
+            <article class="file-chip">
+              <strong>${escapeHtml(edge.source || edge.from)} -> ${escapeHtml(edge.target || edge.to)}</strong>
+              <span>${escapeHtml(edge.relation || edge.label || "")}</span>
+              <p>${escapeHtml(edge.reason || "")}</p>
+            </article>
+          `).join("") || "<p>No edges returned.</p>"}
+        </div>
+      </div>
+    </section>
+  ` : "";
+
+  const importantFilesSection = () => `
     <section class="answer-section">
-      <h5>Next Steps</h5>
+      <h5>Important Files</h5>
+      ${(answer.important_files || []).map((file) => `
+        <article class="file-chip">
+          <strong>${escapeHtml(file.path)}</strong>
+          <span>${escapeHtml(file.stage || "")}</span>
+          <p>${escapeHtml(file.why || "")}</p>
+          ${(file.symbols || []).length ? `<em>${escapeHtml(file.symbols.join(", "))}</em>` : ""}
+        </article>
+      `).join("") || "<p>No files returned.</p>"}
+    </section>
+  `;
+
+  const codePointersSection = () => `
+    <section class="answer-section">
+      <h5>${answerType === "debugger" ? "Debug Checklist" : "Code Pointers"}</h5>
+      ${(answer.code_pointers || []).map((pointer) => `
+        <article class="file-chip">
+          <strong>${escapeHtml(pointer.symbol || pointer.file)}</strong>
+          <span>${escapeHtml(pointer.file || "")}</span>
+          <p>${escapeHtml(pointer.reason || "")}</p>
+        </article>
+      `).join("") || "<p>No code pointers returned.</p>"}
+    </section>
+  `;
+
+  const nextStepsSection = () => `
+    <section class="answer-section">
+      <h5>${answerType === "debugger" ? "Checks To Run" : "Next Steps"}</h5>
       <ul>${(answer.next_steps || []).map((step) => `<li>${escapeHtml(step)}</li>`).join("") || "<li>Ask a more specific follow-up question.</li>"}</ul>
     </section>
+  `;
 
+  const sourcesSection = () => `
     <section class="answer-sources">
       <h5>Retrieved Sources</h5>
       ${(data.sources || []).map((source) => `<span class="badge">${escapeHtml(source)}</span>`).join("") || "<span class=\"badge\">none</span>"}
     </section>
+  `;
+
+  const twoColumnDetails = () => `
+    <section class="answer-grid">
+      ${importantFilesSection()}
+      ${codePointersSection()}
+    </section>
+  `;
+
+  const modeSections = {
+    tree: [treeSection(), importantFilesSection(), nextStepsSection(), sourcesSection()],
+    flow: [flowSection(), codePointersSection(), nextStepsSection(), sourcesSection()],
+    graph: [graphSection(), importantFilesSection(), sourcesSection()],
+    student: [keyPointsSection(), flowSection(), importantFilesSection(), nextStepsSection()],
+    debugger: [codePointersSection(), importantFilesSection(), nextStepsSection(), sourcesSection()],
+    professional: [keyPointsSection(), twoColumnDetails(), sourcesSection()],
+  };
+  const selectedSections = (modeSections[answerType] || modeSections.professional).filter(Boolean).join("");
+
+  els.answerBox.className = "answer answer-card";
+  els.answerBox.innerHTML = `
+    <section class="answer-hero">
+      <span class="badge">${escapeHtml(answerType)}</span>
+      <h4>${escapeHtml(answer.headline || "Codebase Answer")}</h4>
+      <p>${escapeHtml(answer.short_answer || data.answer || "")}</p>
+    </section>
+    <section class="answer-mode-lens">
+      <div>
+        <strong>${escapeHtml(modeInfo.title)}</strong>
+        <p>${escapeHtml(modeInfo.focus)}</p>
+      </div>
+      <div>
+        <strong>How a student should read it</strong>
+        <p>${escapeHtml(modeInfo.student)}</p>
+      </div>
+      <div>
+        <strong>Expected output</strong>
+        <p>${escapeHtml(modeInfo.output)}</p>
+      </div>
+    </section>
+    ${selectedSections}
+  `;
+}
+
+function updateAnswerModeHelp() {
+  if (!els.answerModeHelp || !els.answerMode) return;
+  const mode = els.answerMode.value;
+  const info = answerModeInfo[mode] || answerModeInfo.auto;
+  els.answerModeHelp.innerHTML = `
+    <strong>${escapeHtml(info.title)}</strong>
+    <span>${escapeHtml(info.student)}</span>
   `;
 }
 
@@ -1537,11 +1773,17 @@ function bindEvents() {
     setStatus(err.message, true);
   }));
   els.answerMode.addEventListener("change", () => {
+    updateAnswerModeHelp();
     if (!els.questionInput.value.trim()) return;
     const label = els.answerMode.options[els.answerMode.selectedIndex]?.textContent || "mode";
     els.answerBox.className = "answer empty";
     els.answerBox.textContent = `Mode changed to ${label}. Click Ask to generate a fresh ${label} answer.`;
     setStatus(`Mode changed to ${label}. Ask again to refresh the answer.`);
+  });
+  els.llmProvider?.addEventListener("change", () => {
+    state.llmProvider = els.llmProvider.value;
+    state.llmProviderInitialized = true;
+    setStatus(`LLM provider changed to ${state.llmProvider}. Analyze or ask again to refresh LLM-based results.`);
   });
   document.querySelectorAll(".tab").forEach((tab) => {
     tab.addEventListener("click", () => showView(tab.dataset.view));
@@ -1557,4 +1799,5 @@ function bindEvents() {
 
 els.apiBase.value = defaultApiBase();
 bindEvents();
+updateAnswerModeHelp();
 checkHealth().catch(() => setStatus("Start the backend, then check health."));

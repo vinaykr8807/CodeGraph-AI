@@ -28,6 +28,14 @@
             <input id="repoUrl" placeholder="https://github.com/owner/repo" autocomplete="off">
           </label>
 
+          <label class="field">
+            <span>LLM provider</span>
+            <select id="llmProvider" aria-label="LLM provider">
+              <option value="gemini">Gemini 2.5 Flash</option>
+              <option value="groq">Groq</option>
+            </select>
+          </label>
+
           <div class="actions">
             <button id="healthBtn" type="button">Check Health</button>
             <button id="ingestBtn" type="button" class="primary">Analyze Repo</button>
@@ -142,14 +150,15 @@
               <div class="query-box">
                 <textarea id="questionInput" rows="4" placeholder="Where is the main logic?"></textarea>
                 <select id="answerMode" aria-label="Answer mode">
-                  <option value="auto">Auto Mode</option>
-                  <option value="tree">Tree View</option>
-                  <option value="flow">Flow View</option>
-                  <option value="graph">Graph View</option>
-                  <option value="student">Student Explanation</option>
-                  <option value="debugger">Debugging Help</option>
-                  <option value="professional">Professional Summary</option>
+                  <option value="auto">Auto - choose best lens</option>
+                  <option value="tree">Tree - where code lives</option>
+                  <option value="flow">Flow - what runs next</option>
+                  <option value="graph">Graph - how files connect</option>
+                  <option value="student">Student - explain simply</option>
+                  <option value="debugger">Debug - what to check</option>
+                  <option value="professional">Professional - compact review</option>
                 </select>
+                <div id="answerModeHelp" class="mode-help"></div>
                 <input id="filePathInput" placeholder="Optional file path filter">
                 <button id="askBtn" class="primary" type="button">Ask</button>
               </div>

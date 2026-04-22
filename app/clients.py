@@ -2,7 +2,7 @@ import hashlib
 import json
 import os
 import re
-from typing import Any, Optional, cast
+from typing import Any, Optional, TypedDict, cast
 
 import faiss
 import numpy as np
@@ -12,6 +12,7 @@ from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
 
 from .config import (
+    GEMINI_API_KEY,
     GITHUB_TOKEN,
     GROQ_API_KEY,
     NEO4J_DATABASE,
@@ -33,8 +34,25 @@ FAISS_PATH = os.path.join(STATE_DIR, "faiss.index")
 _embedder: Optional[SentenceTransformer] = None
 _embedding_backend = "uninitialized"
 _embedding_error = ""
+gemini_client_error = ""
+groq_client_error = ""
 
-groq_client = Groq(api_key=GROQ_API_KEY) if is_real_secret(GROQ_API_KEY) else None
+class GeminiClientConfig(TypedDict):
+    api_key: str
+
+
+try:
+    gemini_client: Optional[GeminiClientConfig] = {"api_key": GEMINI_API_KEY} if is_real_secret(GEMINI_API_KEY) else None
+except Exception as exc:
+    gemini_client = None
+    gemini_client_error = str(exc)
+
+try:
+    groq_client: Optional[Groq] = Groq(api_key=GROQ_API_KEY) if is_real_secret(GROQ_API_KEY) else None
+except Exception as exc:
+    groq_client = None
+    groq_client_error = str(exc)
+
 neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 redis_client = redis.Redis(
     host=REDIS_HOST,

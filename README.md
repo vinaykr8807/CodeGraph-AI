@@ -34,7 +34,7 @@ CodeGraph AI analyzes a GitHub repository and produces multiple synchronized vie
 - **Line-by-Line Explanation**: student-friendly walkthrough of selected files.
 - **Ask The Codebase**: RAG-style question answering over indexed chunks, README context, tree context, flow context, and graph context.
 
-The backend combines deterministic static analysis with optional LLM summaries. If Groq is unavailable or rate-limited, the app falls back to local rule-based analysis and indexed repository context instead of crashing.
+The backend combines deterministic static analysis with optional LLM summaries. You can use Gemini 2.5 Flash or Groq from the UI. If the selected provider is unavailable or rate-limited, the app falls back to local rule-based analysis and indexed repository context instead of crashing.
 
 ## Core Capabilities
 
@@ -48,8 +48,8 @@ The backend combines deterministic static analysis with optional LLM summaries. 
 | Neo4j graph | Stores files, datasets, functions, classes, libraries, tags, and relationships. |
 | FAISS search | Indexes 50-line chunks for semantic retrieval and Ask-the-Codebase answers. |
 | Persistent index | Saves chunk metadata and FAISS index under `.codegraph_state/` so chunks survive backend restarts. |
-| Groq summaries | Optionally produces file roles, architecture diagrams, presentation graphs, and answers. |
-| Local fallback | Uses static metadata and indexed chunks if Groq is missing, exhausted, or rate-limited. |
+| Gemini or Groq summaries | Optionally produce file roles, architecture diagrams, presentation graphs, and answers. |
+| Local fallback | Uses static metadata and indexed chunks if the selected LLM is missing, exhausted, or rate-limited. |
 | Frontend UI | Vanilla HTML/CSS/JS interface served directly by FastAPI. |
 
 ## Architecture
@@ -184,7 +184,7 @@ LLM answers are requested as compact **TOML** instead of verbose JSON to reduce 
 | Cache | Redis |
 | Vector search | FAISS |
 | Embeddings | `sentence-transformers/all-MiniLM-L6-v2`, with deterministic hash fallback |
-| LLM | Groq API, configurable model |
+| LLM | Gemini 2.5 Flash or Groq, configurable provider/model |
 | GitHub access | GitHub REST API |
 | Data parsing | Python AST, CSV/JSON readers, regex-based JS/TS parser |
 
@@ -257,6 +257,9 @@ Edit `.env` with your local settings. Do not commit `.env`; it is ignored by Git
 
 ```env
 GITHUB_TOKEN=your_github_token_here
+GEMINI_API_KEY=your_gemini_api_key_here
+DEFAULT_LLM_PROVIDER=gemini
+GEMINI_MODEL=gemini-2.5-flash
 GROQ_API_KEY=your_groq_api_key_here
 GROQ_MODEL=llama-3.3-70b-versatile
 NEO4J_URI=neo4j+s://your-instance.databases.neo4j.io
@@ -270,6 +273,9 @@ REDIS_PORT=6379
 | Variable | Required | Description |
 |---|---:|---|
 | `GITHUB_TOKEN` | Recommended | Improves GitHub API limits and enables private repository access. |
+| `GEMINI_API_KEY` | Optional | Enables Gemini-powered summaries, diagrams, file explanations, and Ask answers. |
+| `DEFAULT_LLM_PROVIDER` | Optional | Default provider used by the backend and UI. Use `gemini` or `groq`. Defaults to `gemini`. |
+| `GEMINI_MODEL` | Optional | Gemini model name. Defaults to `gemini-2.5-flash`. |
 | `GROQ_API_KEY` | Optional | Enables LLM-powered summaries, diagrams, file explanations, and Ask answers. |
 | `GROQ_MODEL` | Optional | Groq model name. Defaults to `llama-3.3-70b-versatile`. |
 | `NEO4J_URI` | Required | Neo4j connection URI, for example `bolt://localhost:7687` or Aura URI. |
@@ -280,6 +286,8 @@ REDIS_PORT=6379
 | `REDIS_PORT` | Required | Redis port. Usually `6379`. |
 | `EMBEDDING_MODEL` | Optional | Embedding model. Defaults to `sentence-transformers/all-MiniLM-L6-v2`. |
 | `ALLOW_EMBEDDING_MODEL_DOWNLOAD` | Optional | Set to `true` to allow model download. If false, local cache is used first. |
+
+In the frontend, use the `LLM provider` dropdown before clicking `Analyze Repo` if you want to analyze with Gemini or Groq explicitly.
 
 ### Local Neo4j And Redis With Docker
 
